@@ -3,6 +3,7 @@ package alicloud
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/hashicorp/terraform-plugin-sdk/helper/validation"
 	"regexp"
 	"strings"
 	"time"
@@ -442,6 +443,93 @@ func resourceAlicloudPolarDBCluster() *schema.Resource {
 			"db_node_id": {
 				Type:     schema.TypeString,
 				Optional: true,
+			},
+			"cluster_endpoint": {
+				Type:     schema.TypeList,
+				MaxItems: 1, // 每个集群只有一个endpoint，所以这里限制为最多一个元素
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"read_write_mode": {
+							Type:         schema.TypeString,
+							ValidateFunc: validation.StringInSlice([]string{"ReadWrite", "ReadOnly"}, false),
+							Optional:     true,
+							Computed:     true,
+						},
+						"auto_add_new_nodes": {
+							Type:         schema.TypeString,
+							ValidateFunc: validation.StringInSlice([]string{"Enable", "Disable"}, false),
+							Optional:     true,
+							Computed:     true,
+						},
+						"endpoint_config": {
+							Type:     schema.TypeMap,
+							Optional: true,
+							Computed: true,
+						},
+						"ssl_enabled": {
+							Type:         schema.TypeString,
+							ValidateFunc: validation.StringInSlice([]string{"Enable", "Disable", "Update"}, false),
+							Optional:     true,
+						},
+						"ssl_connection_string": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"net_type": {
+							Type:         schema.TypeString,
+							Optional:     true,
+							ValidateFunc: validation.StringInSlice([]string{"Public", "Private", "Inner"}, false),
+						},
+						"ssl_expire_time": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"ssl_auto_rotate": {
+							Type:         schema.TypeString,
+							Optional:     true,
+							ValidateFunc: validation.StringInSlice([]string{"Enable", "Disable"}, false),
+						},
+						"ssl_certificate_url": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"db_endpoint_id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						"db_endpoint_description": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+						"connection_prefix": {
+							Type:         schema.TypeString,
+							Optional:     true,
+							Computed:     true,
+							ValidateFunc: validation.StringMatch(regexp.MustCompile(`^[a-z][a-z0-9\\-]{4,28}[a-z0-9]$`), "The prefix must be 6 to 30 characters in length, and can contain lowercase letters, digits, and hyphens (-),  must start with a letter and end with a digit or letter."),
+						},
+						"port": {
+							Type:     schema.TypeInt,
+							Optional: true,
+							Computed: true,
+						},
+						// ... 其他endpoint相关的属性 ...
+					},
+				},
+				Computed: true,
+			},
+			"primary_endpoint": {
+				Type:     schema.TypeList,
+				MaxItems: 1, // 每个集群只有一个endpoint，所以这里限制为最多一个元素
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"db_endpoint_id": {
+							Type:     schema.TypeString,
+							Computed: true,
+						},
+						// ... 其他endpoint相关的属性 ...
+					},
+				},
+				Computed: true,
 			},
 		},
 	}
