@@ -115,7 +115,7 @@ func resourceAlicloudPolarDBEndpointAddressCreate(d *schema.ResourceData, meta i
 func resourceAlicloudPolarDBEndpointAddressRead(d *schema.ResourceData, meta interface{}) error {
 	client := meta.(*connectivity.AliyunClient)
 	polarDBService := PolarDBService{client}
-	object, err := polarDBService.DescribePolarDBConnection(d.Id())
+	object, err := polarDBService.DescribePolarDBConnection(d.Id(), "Public")
 
 	if err != nil {
 		if IsExpectedErrors(err, []string{"InvalidDBClusterId.NotFound"}) {
@@ -154,7 +154,7 @@ func resourceAlicloudPolarDBEndpointAddressUpdate(d *schema.ResourceData, meta i
 		request.RegionId = client.RegionId
 		request.DBClusterId = parts[0]
 		request.DBEndpointId = parts[1]
-		object, err := polarDBService.DescribePolarDBConnection(d.Id())
+		object, err := polarDBService.DescribePolarDBConnection(d.Id(), "Public")
 		if err != nil {
 			return WrapError(err)
 		}
@@ -178,7 +178,7 @@ func resourceAlicloudPolarDBEndpointAddressUpdate(d *schema.ResourceData, meta i
 		}
 
 		// wait instance connection_prefix modify success
-		if err := polarDBService.WaitForPolarDBConnectionPrefix(d.Id(), request.ConnectionStringPrefix, DefaultTimeoutMedium); err != nil {
+		if err := polarDBService.WaitForPolarDBConnectionPrefix(d.Id(), "", "", request.ConnectionStringPrefix, DefaultTimeoutMedium); err != nil {
 			return WrapError(err)
 		}
 	}
@@ -199,7 +199,7 @@ func resourceAlicloudPolarDBEndpointAddressDelete(d *schema.ResourceData, meta i
 	request.DBEndpointId = parts[1]
 
 	err := resource.Retry(5*time.Minute, func() *resource.RetryError {
-		object, err := polarDBService.DescribePolarDBConnection(d.Id())
+		object, err := polarDBService.DescribePolarDBConnection(d.Id(), "Public")
 		if err != nil {
 			return resource.NonRetryableError(WrapError(err))
 		}

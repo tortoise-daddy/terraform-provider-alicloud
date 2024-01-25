@@ -447,6 +447,7 @@ func resourceAlicloudPolarDBCluster() *schema.Resource {
 			"cluster_endpoint": {
 				Type:     schema.TypeList,
 				MaxItems: 1, // 每个集群只有一个endpoint，所以这里限制为最多一个元素
+				Optional: true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"read_write_mode": {
@@ -508,7 +509,7 @@ func resourceAlicloudPolarDBCluster() *schema.Resource {
 							ValidateFunc: validation.StringMatch(regexp.MustCompile(`^[a-z][a-z0-9\\-]{4,28}[a-z0-9]$`), "The prefix must be 6 to 30 characters in length, and can contain lowercase letters, digits, and hyphens (-),  must start with a letter and end with a digit or letter."),
 						},
 						"port": {
-							Type:     schema.TypeInt,
+							Type:     schema.TypeString,
 							Optional: true,
 							Computed: true,
 						},
@@ -571,7 +572,7 @@ func resourceAlicloudPolarDBClusterCreate(d *schema.ResourceData, meta interface
 	d.SetId(fmt.Sprint(response["DBClusterId"]))
 
 	// wait cluster status change from Creating to running
-	stateConf := BuildStateConf([]string{"Creating"}, []string{"Running"}, d.Timeout(schema.TimeoutCreate), 5*time.Minute, polarDBService.PolarDBClusterStateRefreshFunc(d.Id(), []string{"Deleting"}))
+	stateConf := BuildStateConf([]string{"Creating"}, []string{"Running"}, d.Timeout(schema.TimeoutCreate), 30*time.Second, polarDBService.PolarDBClusterStateRefreshFunc(d.Id(), []string{"Deleting"}))
 	if _, err := stateConf.WaitForState(); err != nil {
 		return WrapErrorf(err, IdMsg, d.Id())
 	}
@@ -588,6 +589,30 @@ func resourceAlicloudPolarDBClusterUpdate(d *schema.ResourceData, meta interface
 	client := meta.(*connectivity.AliyunClient)
 	polarDBService := PolarDBService{client}
 	d.Partial(true)
+
+	request := polardb.CreateDescribeDBClusterEndpointsRequest()
+
+	request.RegionId = client.RegionId
+	request.DBClusterId = d.Id()
+
+	raw, err := client.WithPolarDBClient(func(polardbClient *polardb.Client) (interface{}, error) {
+		return polardbClient.DescribeDBClusterEndpoints(request)
+	})
+
+	if err != nil {
+		return WrapErrorf(err, DataDefaultErrorMsg, "alicloud_polardb_cluster_endpoint", request.GetActionName(), AlibabaCloudSdkGoERROR)
+	}
+	clusterEndpointId := ""
+	//primaryEndpointId := ""
+	response, _ := raw.(*polardb.DescribeDBClusterEndpointsResponse)
+	for _, item := range response.Items {
+		if item.EndpointType == "Cluster" {
+			clusterEndpointId = item.DBEndpointId
+		}
+		if item.EndpointType == "Primary" {
+			//primaryEndpointId = item.DBEndpointId
+		}
+	}
 
 	if d.HasChange("default_time_zone") || d.HasChange("lower_case_table_names") || d.HasChange("loose_polar_log_bin") {
 		if err := polarDBService.CreateClusterParamsModifyParameters(d); err != nil {
@@ -952,6 +977,142 @@ func resourceAlicloudPolarDBClusterUpdate(d *schema.ResourceData, meta interface
 			return WrapErrorf(err, DefaultErrorMsg, d.Id(), action, ProviderERROR)
 		}
 		d.SetPartial("deletion_lock")
+	}
+
+	if d.HasChange("cluster_endpoint") {
+		dbClusterId := d.Id()
+		if v, ok := d.GetOk("cluster_endpoint"); ok && len(v.([]interface{})) > 0 && v.([]interface{})[0] != nil {
+			//clusterEndpointMap := v.([]interface{})[0].(map[string]interface{})
+			if d.HasChange("cluster_endpoint.0.nodes") || d.HasChange("cluster_endpoint.0.read_write_mode") || d.HasChange("cluster_endpoint.0.auto_add_new_nodes") || d.HasChange("cluster_endpoint.0.endpoint_config") || d.HasChange("cluster_endpoint.0.db_endpoint_description") {
+				modifyEndpointRequest := polardb.CreateModifyDBClusterEndpointRequest()
+				modifyEndpointRequest.RegionId = client.RegionId
+				modifyEndpointRequest.DBClusterId = dbClusterId
+				modifyEndpointRequest.DBEndpointId = clusterEndpointId
+
+				configItem := make(map[string]string)
+				if d.HasChange("cluster_endpoint.0.nodes") {
+					nodes := expandStringList(d.Get("cluster_endpoint.0.nodes").(*schema.Set).List())
+					dbNodes := strings.Join(nodes, ",")
+					modifyEndpointRequest.Nodes = dbNodes
+					configItem["Nodes"] = dbNodes
+				}
+				if d.HasChange("cluster_endpoint.0.read_write_mode") {
+					modifyEndpointRequest.ReadWriteMode = d.Get("cluster_endpoint.0.read_write_mode").(string)
+					configItem["ReadWriteMode"] = d.Get("cluster_endpoint.0.read_write_mode").(string)
+				}
+				if d.HasChange("cluster_endpoint.0.auto_add_new_nodes") {
+					modifyEndpointRequest.AutoAddNewNodes = d.Get("cluster_endpoint.0.auto_add_new_nodes").(string)
+					configItem["AutoAddNewNodes"] = d.Get("cluster_endpoint.0.auto_add_new_nodes").(string)
+				}
+				if d.HasChange("cluster_endpoint.0.endpoint_config") {
+					endpointConfig, err := json.Marshal(d.Get("cluster_endpoint.0.endpoint_config"))
+					if err != nil {
+						return WrapError(err)
+					}
+					modifyEndpointRequest.EndpointConfig = string(endpointConfig)
+					configItem["EndpointConfig"] = string(endpointConfig)
+				}
+				if d.HasChange("cluster_endpoint.0.db_endpoint_description") {
+					modifyEndpointRequest.DBEndpointDescription = d.Get("cluster_endpoint.0.db_endpoint_description").(string)
+					configItem["DBEndpointDescription"] = d.Get("cluster_endpoint.0.db_endpoint_description").(string)
+				}
+				if err := resource.Retry(8*time.Minute, func() *resource.RetryError {
+					raw, err := client.WithPolarDBClient(func(polarDBClient *polardb.Client) (interface{}, error) {
+						return polarDBClient.ModifyDBClusterEndpoint(modifyEndpointRequest)
+					})
+					if err != nil {
+						if IsExpectedErrors(err, []string{"EndpointStatus.NotSupport", "OperationDenied.DBClusterStatus"}) {
+							return resource.RetryableError(err)
+						}
+						return resource.NonRetryableError(err)
+					}
+					addDebug(modifyEndpointRequest.GetActionName(), raw, modifyEndpointRequest.RpcRequest, modifyEndpointRequest)
+					return nil
+				}); err != nil {
+					return WrapErrorf(err, DefaultErrorMsg, d.Id(), modifyEndpointRequest.GetActionName(), AlibabaCloudSdkGoERROR)
+				}
+
+				// wait cluster endpoint config modified
+				if err := polarDBService.WaitPolardbEndpointConfigEffect(
+					d.Id(), configItem, DefaultTimeoutMedium); err != nil {
+					return WrapError(err)
+				}
+			}
+
+			if d.HasChange("cluster_endpoint.0.ssl_enabled") || d.HasChange("cluster_endpoint.0.net_type") || d.HasChange("cluster_endpoint.0.ssl_auto_rotate") {
+				if d.Get("cluster_endpoint.0.ssl_enabled") == "" && d.Get("cluster_endpoint.0.net_type") != "" {
+					return WrapErrorf(Error("Need to specify ssl_enabled as Enable or Disable, if you want to modify the net_type."), DefaultErrorMsg, d.Id(), "ModifyDBClusterSSL", ProviderERROR)
+				}
+				modifySSLRequest := polardb.CreateModifyDBClusterSSLRequest()
+				modifySSLRequest.SSLEnabled = d.Get("cluster_endpoint.0.ssl_enabled").(string)
+				modifySSLRequest.NetType = d.Get("cluster_endpoint.0.net_type").(string)
+				modifySSLRequest.DBClusterId = dbClusterId
+				modifySSLRequest.DBEndpointId = clusterEndpointId
+				modifySSLRequest.SSLAutoRotate = d.Get("cluster_endpoint.0.ssl_auto_rotate").(string)
+				if err := resource.Retry(8*time.Minute, func() *resource.RetryError {
+					raw, err := client.WithPolarDBClient(func(polarDBClient *polardb.Client) (interface{}, error) {
+						return polarDBClient.ModifyDBClusterSSL(modifySSLRequest)
+					})
+					if err != nil {
+						if IsExpectedErrors(err, []string{"EndpointStatus.NotSupport", "OperationDenied.DBClusterStatus"}) {
+							return resource.RetryableError(err)
+						}
+						return resource.NonRetryableError(err)
+					}
+					addDebug(modifySSLRequest.GetActionName(), raw, modifySSLRequest.RpcRequest, modifySSLRequest)
+					return nil
+				}); err != nil {
+					return WrapErrorf(err, DefaultErrorMsg, d.Id(), modifySSLRequest.GetActionName(), AlibabaCloudSdkGoERROR)
+				}
+				// wait cluster status change from SSL_MODIFYING to Running
+				stateConf := BuildStateConf([]string{"cluster_endpoint.0.SSL_MODIFYING"}, []string{"cluster_endpoint.0.Running"}, d.Timeout(schema.TimeoutUpdate), 5*time.Minute, polarDBService.PolarDBClusterStateRefreshFunc(dbClusterId, []string{"Deleting"}))
+				if _, err := stateConf.WaitForState(); err != nil {
+					return WrapErrorf(err, IdMsg, dbClusterId)
+				}
+			}
+			if d.HasChange("cluster_endpoint.0.connection_prefix") || d.HasChange("cluster_endpoint.0.port") {
+				request := polardb.CreateModifyDBEndpointAddressRequest()
+				request.RegionId = client.RegionId
+				request.DBClusterId = dbClusterId
+				request.DBEndpointId = clusterEndpointId
+				object, err := polarDBService.DescribePolarDBConnectionV2(d.Id(), clusterEndpointId, "Private")
+				if err != nil {
+					return WrapError(err)
+				}
+
+				request.NetType = "Private"
+				request.ConnectionStringPrefix = d.Get("cluster_endpoint.0.connection_prefix").(string)
+				request.Port = d.Get("cluster_endpoint.0.port").(string)
+				prefix := strings.Split(object.ConnectionString, ".")
+				if (request.Port != "" && request.Port != object.Port) || (request.ConnectionStringPrefix != "" && request.ConnectionStringPrefix != prefix[0]) {
+					if err := resource.Retry(8*time.Minute, func() *resource.RetryError {
+						raw, err := client.WithPolarDBClient(func(polarDBClient *polardb.Client) (interface{}, error) {
+							return polarDBClient.ModifyDBEndpointAddress(request)
+						})
+						if err != nil {
+							if IsExpectedErrors(err, []string{"EndpointStatus.NotSupport", "OperationDenied.DBClusterStatus"}) {
+								return resource.RetryableError(err)
+							}
+							return resource.NonRetryableError(err)
+						}
+						addDebug(request.GetActionName(), raw, request.RpcRequest, request)
+						return nil
+					}); err != nil {
+						return WrapErrorf(err, DefaultErrorMsg, d.Id(), request.GetActionName(), AlibabaCloudSdkGoERROR)
+					}
+
+					// wait instance connection_prefix modify success
+					if err := polarDBService.WaitForPolarDBConnectionPrefixV2(d.Id(), clusterEndpointId, request.ConnectionStringPrefix, request.Port, "Private", DefaultTimeoutMedium); err != nil {
+						return WrapError(err)
+					}
+
+					stateConf := BuildStateConf([]string{"NetAddressModifying"}, []string{"Running"}, d.Timeout(schema.TimeoutUpdate), 10*time.Second, polarDBService.PolarDBClusterStateRefreshFunc(request.DBClusterId, []string{"Deleting"}))
+					if _, err := stateConf.WaitForState(); err != nil {
+						return WrapErrorf(err, IdMsg, d.Id())
+					}
+				}
+			}
+		}
 	}
 
 	if d.IsNewResource() {
@@ -1537,6 +1698,101 @@ func resourceAlicloudPolarDBClusterRead(d *schema.ResourceData, meta interface{}
 			d.Set("hot_replica_mode", clusterAttribute.DBNodes[formatInt(dbNodeIdIndex)].HotReplicaMode)
 		}
 	}
+
+	request := polardb.CreateDescribeDBClusterEndpointsRequest()
+
+	request.RegionId = client.RegionId
+	request.DBClusterId = d.Id()
+
+	raw, err := client.WithPolarDBClient(func(polardbClient *polardb.Client) (interface{}, error) {
+		return polardbClient.DescribeDBClusterEndpoints(request)
+	})
+
+	if err != nil {
+		return WrapErrorf(err, DataDefaultErrorMsg, "alicloud_polardb_cluster_endpoint", request.GetActionName(), AlibabaCloudSdkGoERROR)
+	}
+
+	var object polardb.DBEndpoint
+	//primaryEndpointId := ""
+	response, _ := raw.(*polardb.DescribeDBClusterEndpointsResponse)
+	for _, item := range response.Items {
+		if item.EndpointType == "Cluster" {
+			object = item
+		}
+		if item.EndpointType == "Primary" {
+			//primaryEndpointId = item.DBEndpointId
+		}
+	}
+	if err != nil {
+		if NotFoundError(err) {
+			d.SetId("")
+			return nil
+		}
+		return WrapError(err)
+	}
+
+	clusterEndpointId := object.DBEndpointId
+	d.Set("cluster_endpoint.0.db_endpoint_id", clusterEndpointId)
+	d.Set("cluster_endpoint.0.endpoint_type", object.EndpointType)
+	d.Set("cluster_endpoint.0.db_endpoint_description", object.DBEndpointDescription)
+
+	if err = polarDBService.RefreshEndpointConfigV2(d, clusterEndpointId); err != nil {
+		return WrapError(err)
+	}
+
+	dbClusterSSL, err := polarDBService.DescribePolarDBClusterSSLV2(d)
+
+	var sslConnectionString string
+	var sslExpireTime string
+	var sslEnabled string
+	if len(dbClusterSSL.Items) < 1 {
+		sslConnectionString = ""
+		sslExpireTime = ""
+		sslEnabled = ""
+	} else if len(dbClusterSSL.Items) == 1 && dbClusterSSL.Items[0].DBEndpointId == "" {
+		sslConnectionString = dbClusterSSL.Items[0].SSLConnectionString
+		sslExpireTime = dbClusterSSL.Items[0].SSLExpireTime
+		sslEnabled = convertPolarDBSSLEnableResponse(dbClusterSSL.Items[0].SSLEnabled)
+	} else {
+		for _, item := range dbClusterSSL.Items {
+			if item.DBEndpointId == clusterEndpointId {
+				sslConnectionString = item.SSLConnectionString
+				sslExpireTime = item.SSLExpireTime
+				sslEnabled = convertPolarDBSSLEnableResponse(item.SSLEnabled)
+			}
+		}
+	}
+	sslAutoRotate := dbClusterSSL.SSLAutoRotate
+
+	if err := d.Set("cluster_endpoint.0.ssl_connection_string", sslConnectionString); err != nil {
+		return WrapError(err)
+	}
+	if err := d.Set("cluster_endpoint.0.ssl_expire_time", sslExpireTime); err != nil {
+		return WrapError(err)
+	}
+	if err := d.Set("cluster_endpoint.0.ssl_auto_rotate", sslAutoRotate); err != nil {
+		return WrapError(err)
+	}
+	if sslEnabled == "Enable" {
+		d.Set("cluster_endpoint.0.ssl_certificate_url", "https://apsaradb-public.oss-ap-southeast-1.aliyuncs.com/ApsaraDB-CA-Chain.zip?file=ApsaraDB-CA-Chain.zip&regionId="+polarDBService.client.RegionId)
+	} else {
+		d.Set("cluster_endpoint.0.ssl_certificate_url", "")
+	}
+
+	privateAdress, err := polarDBService.DescribePolarDBConnectionV2(d.Id(), clusterEndpointId, "Private")
+
+	if err != nil {
+		if IsExpectedErrors(err, []string{"InvalidDBClusterId.NotFound"}) {
+			d.SetId("")
+			return nil
+		}
+		return WrapError(err)
+	}
+
+	d.Set("cluster_endpoint.0.port", privateAdress.Port)
+	prefix := strings.Split(privateAdress.ConnectionString, ".")
+	d.Set("cluster_endpoint.0.connection_prefix", prefix[0])
+
 	return nil
 }
 

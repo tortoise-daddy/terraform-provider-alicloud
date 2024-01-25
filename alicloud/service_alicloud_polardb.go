@@ -361,7 +361,7 @@ func (s *PolarDBService) DescribePolarDBAccountPrivilege(id string) (account *po
 func (s *PolarDBService) WaitForPolarDBConnection(id string, status Status, timeout int) error {
 	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 	for {
-		object, err := s.DescribePolarDBConnection(id)
+		object, err := s.DescribePolarDBConnection(id, "Public")
 		if err != nil {
 			if NotFoundError(err) {
 				if status == Deleted {
@@ -497,7 +497,7 @@ func (s *PolarDBService) WaitForPolarDBEndpoints(d *schema.ResourceData, status 
 	}
 }
 
-func (s *PolarDBService) DescribePolarDBConnection(id string) (*polardb.Address, error) {
+func (s *PolarDBService) DescribePolarDBConnection(id string, netType string) (*polardb.Address, error) {
 	parts, err := ParseResourceId(id, 2)
 	if err != nil {
 		return nil, WrapError(err)
@@ -517,7 +517,7 @@ func (s *PolarDBService) DescribePolarDBConnection(id string) (*polardb.Address,
 			for _, o := range object {
 				if o.DBEndpointId == parts[1] {
 					for _, p := range o.AddressItems {
-						if p.NetType == "Public" {
+						if p.NetType == netType {
 							return &p, nil
 						}
 					}
@@ -531,6 +531,38 @@ func (s *PolarDBService) DescribePolarDBConnection(id string) (*polardb.Address,
 	}
 
 	return nil, WrapErrorf(Error(GetNotFoundMessage("DBConnection", id)), NotFoundMsg, ProviderERROR)
+}
+
+func (s *PolarDBService) DescribePolarDBConnectionV2(dbClusterId, dbEndpointId string, netType string) (*polardb.Address, error) {
+	deadline := time.Now().Add(time.Duration(DefaultIntervalLong) * time.Second)
+	for {
+		object, err := s.DescribePolarDBInstanceNetInfo(dbClusterId)
+
+		if err != nil {
+			if NotFoundError(err) {
+				return nil, WrapErrorf(err, NotFoundMsg, AlibabaCloudSdkGoERROR)
+			}
+			return nil, WrapError(err)
+		}
+
+		if object != nil {
+			for _, o := range object {
+				if o.DBEndpointId == dbEndpointId {
+					for _, p := range o.AddressItems {
+						if p.NetType == netType {
+							return &p, nil
+						}
+					}
+				}
+			}
+		}
+		time.Sleep(DefaultIntervalMini * time.Second)
+		if time.Now().After(deadline) {
+			break
+		}
+	}
+
+	return nil, WrapErrorf(Error(GetNotFoundMessage("DBConnection", dbEndpointId)), NotFoundMsg, ProviderERROR)
 }
 
 func (s *PolarDBService) DescribePolarDBInstanceNetInfo(id string) ([]polardb.DBEndpoint, error) {
@@ -596,12 +628,68 @@ func (s *PolarDBService) DescribePolarDBClusterEndpoint(id string) (*polardb.DBE
 	return &response.Items[0], nil
 }
 
+func (s *PolarDBService) DescribePolarDBClusterEndpointV2(dbClusterId, dbEndpointId string) (*polardb.DBEndpoint, error) {
+	request := polardb.CreateDescribeDBClusterEndpointsRequest()
+	request.RegionId = s.client.RegionId
+	request.DBClusterId = dbClusterId
+	request.DBEndpointId = dbEndpointId
+
+	var raw interface{}
+	resource.Retry(5*time.Minute, func() *resource.RetryError {
+		raw, err := s.client.WithPolarDBClient(func(polarDBClient *polardb.Client) (interface{}, error) {
+			return polarDBClient.DescribeDBClusterEndpoints(request)
+		})
+		if err != nil {
+			if IsExpectedErrors(err, []string{"InvalidDBClusterId.NotFound"}) {
+				time.Sleep(10 * time.Second)
+				return resource.RetryableError(err)
+			}
+			return resource.NonRetryableError(err)
+		}
+		addDebug(request.GetActionName(), raw, request.RpcRequest, request)
+		return nil
+	})
+
+	response, _ := raw.(*polardb.DescribeDBClusterEndpointsResponse)
+	if len(response.Items) < 1 {
+		return nil, WrapErrorf(Error(GetNotFoundMessage("DBEndpoint", dbEndpointId)), NotFoundMsg, ProviderERROR)
+	}
+
+	return &response.Items[0], nil
+}
+
 func (s *PolarDBService) DescribePolarDBClusterSSL(d *schema.ResourceData) (ssl *polardb.DescribeDBClusterSSLResponse, err error) {
 	parts, err := ParseResourceId(d.Id(), 2)
 	if err != nil {
 		return nil, WrapError(err)
 	}
 	dbClusterId := parts[0]
+
+	request := polardb.CreateDescribeDBClusterSSLRequest()
+	request.RegionId = s.client.RegionId
+	request.DBClusterId = dbClusterId
+	var raw interface{}
+	err = resource.Retry(5*time.Minute, func() *resource.RetryError {
+		raw, err = s.client.WithPolarDBClient(func(polarDBClient *polardb.Client) (interface{}, error) {
+			return polarDBClient.DescribeDBClusterSSL(request)
+		})
+		if err != nil {
+			if IsExpectedErrors(err, []string{"InvalidDBClusterId.NotFound"}) {
+				time.Sleep(10 * time.Second)
+				return resource.RetryableError(err)
+			}
+			return resource.NonRetryableError(err)
+		}
+		addDebug(request.GetActionName(), raw, request.RpcRequest, request)
+		return nil
+	})
+	response, _ := raw.(*polardb.DescribeDBClusterSSLResponse)
+
+	return response, nil
+}
+
+func (s *PolarDBService) DescribePolarDBClusterSSLV2(d *schema.ResourceData) (ssl *polardb.DescribeDBClusterSSLResponse, err error) {
+	dbClusterId := d.Id()
 
 	request := polardb.CreateDescribeDBClusterSSLRequest()
 	request.RegionId = s.client.RegionId
@@ -786,20 +874,44 @@ func (s *PolarDBService) WaitForPolarDBInstance(id string, status Status, timeou
 	return nil
 }
 
-func (s *PolarDBService) WaitForPolarDBConnectionPrefix(id, prefix string, timeout int) error {
+func (s *PolarDBService) WaitForPolarDBConnectionPrefix(id, prefix, newPort string, netType string, timeout int) error {
 	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 	for {
-		object, err := s.DescribePolarDBConnection(id)
+		object, err := s.DescribePolarDBConnection(id, netType)
 		if err != nil {
 			return WrapError(err)
 		}
 		parts := strings.Split(object.ConnectionString, ".")
-		if prefix == parts[0] {
+		port := object.Port
+
+		if (newPort == "" || newPort == port) && (prefix == "" || prefix == parts[0]) {
 			break
 		}
 
 		if time.Now().After(deadline) {
 			return WrapErrorf(err, WaitTimeoutMsg, id, GetFunc(1), timeout, parts[0], prefix, ProviderERROR)
+		}
+		time.Sleep(DefaultIntervalShort * time.Second)
+	}
+	return nil
+}
+
+func (s *PolarDBService) WaitForPolarDBConnectionPrefixV2(dbClusterId, dbEndpointId, prefix, newPort string, netType string, timeout int) error {
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	for {
+		object, err := s.DescribePolarDBConnectionV2(dbClusterId, dbEndpointId, netType)
+		if err != nil {
+			return WrapError(err)
+		}
+		parts := strings.Split(object.ConnectionString, ".")
+		port := object.Port
+
+		if (newPort == "" || newPort == port) && (prefix == "" || prefix == parts[0]) {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			return WrapErrorf(err, WaitTimeoutMsg, dbEndpointId, GetFunc(1), timeout, parts[0], prefix, ProviderERROR)
 		}
 		time.Sleep(DefaultIntervalShort * time.Second)
 	}
@@ -831,6 +943,36 @@ func (s *PolarDBService) RefreshEndpointConfig(d *schema.ResourceData) error {
 		}
 	}
 	if err := d.Set("endpoint_config", config); err != nil {
+		return WrapError(err)
+	}
+	return nil
+}
+
+func (s *PolarDBService) RefreshEndpointConfigV2(d *schema.ResourceData, dbEndpointId string) error {
+	var config map[string]interface{}
+	config = make(map[string]interface{}, 0)
+	documented, ok := d.GetOk("cluster_endpoint.0.endpoint_config")
+	if !ok {
+		d.Set("cluster_endpoint.0.endpoint_config", config)
+		return nil
+	}
+	object, err := s.DescribePolarDBClusterEndpointV2(d.Id(), dbEndpointId)
+	if err != nil {
+		return WrapError(err)
+	}
+
+	var endpointConfig = make(map[string]interface{})
+	err = json.Unmarshal([]byte(object.EndpointConfig), &endpointConfig)
+	if err != nil {
+		return WrapError(err)
+	}
+
+	for k, v := range documented.(map[string]interface{}) {
+		if _, ok := endpointConfig[k]; ok {
+			config[k] = v
+		}
+	}
+	if err := d.Set("cluster_endpoint.0.endpoint_config", config); err != nil {
 		return WrapError(err)
 	}
 	return nil
